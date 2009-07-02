@@ -27,9 +27,14 @@ class IMAPShSearches
 	end
 
 	def print
+		if @searches.empty?
+			puts "No saved searches."
+			return
+		end
+
 		puts "Saved searches:"
 		@searches.keys.each { |k|
-			puts "#{k}"
+			puts "  #{k} (#{@searches[k].length} items)"
 		}
 	end
 
@@ -65,6 +70,14 @@ end
 
 class IMAPSh
 	attr_accessor :conn, :srvr, :mbox, :username, :searches
+
+	@@FLAG_MAP = {
+		"Seen" => Net::IMAP::SEEN,
+		"Deleted" => Net::IMAP::DELETED,
+	}
+
+	# Max size to process messages at
+	@@MAX_SET_SIZE = 100
 
 	def initialize
 		@searches = IMAPShSearches.new()
@@ -231,6 +244,57 @@ class IMAPSh
 		@searches.delete(seq)
 	end
 
+	def flag(op, flags, seq)
+		if !@searches.exist(seq)
+			warn "Search sequence #{seq} does not exist"
+			return
+		end
+
+		if flags.empty?
+			return
+		end
+
+		set = @searches.get(seq)
+		if set.empty?
+			@searches.delete(seq)
+			return
+		end
+
+
+		# Construct flags from strings
+		flagar = []
+		for flag in flags
+			found = false
+			for f in @@FLAG_MAP.keys
+				if f.upcase == flag.upcase
+					flagar.push(@@FLAG_MAP[f])
+					found = true
+					break
+				end
+			end
+			if !found
+				warn "Unknown flag: " + flag
+				return
+			end
+		end
+
+		i = 0
+		while i < set.length
+			len = (set.length - i) > @@MAX_SET_SIZE ? @@MAX_SET_SIZE :
+				set.length
+
+			if op == "add"
+				@conn.store(set[i, len], "+FLAGS", flagar)
+			else
+				@conn.store(set[i, len], "-FLAGS", flagar)
+			end
+
+			i = i + len
+		end
+
+		@searches.delete(seq)		
+	end
+
 	def delete(seq)
 		if !@searches.exist(seq)
 			warn "Search sequence #{seq} does not exist"
@@ -247,6 +311,8 @@ class IMAPSh
 			warn "No mailbox selected"
 			return
 		end
+
+		# XXX: this should delete all sets!
 
 		@conn.expunge
 	end
@@ -341,6 +407,21 @@ while running
 		end
 
 		imapsh.uniq(cmds[1])
+	elsif cmds[0] == "flags"
+		usage = "Usage: flags (add|remove) flag1 [flag2...] <set>"
+		if cmds.length < 4
+			warn usage
+			next
+		end
+
+		if ! ["add", "remove"].include?(cmds[1])
+			warn usage
+			next
+		end
+
+		cmds.shift
+		imapsh.flag(cmds[0], cmds[1, cmds.length - 2],
+			    cmds[cmds.length - 1])
 	elsif cmds[0] == "delete"
 		if cmds.length != 2
 			warn "Usage: delete <set>"
