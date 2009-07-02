@@ -45,7 +45,7 @@ class IMAPShSearches
 	def delete(seq)
 		seq = Integer(seq)
 
-		if !@searches.exists(seq)
+		if !exist(seq)
 			warn "No saved search at #{seq}"
 		else
 			@searches.delete(seq)
@@ -210,12 +210,14 @@ class IMAPSh
 
 			if curr_id == next_id
 				puts "Deleting message id #{set[i]} as a dup of #{set[i + 1]}"
-				# XXX do delete here!
+				@conn.store(set[i], "+FLAGS", [:Deleted])
 			end
 
 			curr_id = next_id
 			next_id = nil
-		end			
+		end
+
+		@searches.delete(seq)
 	end
 
 	def delete(seq)
