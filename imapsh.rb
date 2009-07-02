@@ -195,6 +195,9 @@ class IMAPSh
 
 		curr_id = nil
 		next_id = nil
+		count = Float(0.0)
+		print sprintf("%5.1f%% complete", count)
+		$stdout.flush
 		for i in (0..(set.length - 2))
 			if curr_id.nil?
 				res = @conn.fetch(set[i],
@@ -209,14 +212,22 @@ class IMAPSh
 			#puts "current id: #{curr_id}, next_id: #{next_id}"
 
 			if curr_id == next_id
-				puts "Deleting message id #{set[i]} as a dup of #{set[i + 1]}"
 				@conn.store(set[i], "+FLAGS", [:Deleted])
 			end
 
 			curr_id = next_id
 			next_id = nil
+
+			curr_count = (Float(i + 1) / Float(set.length - 1)) *
+				Float(100.0)
+			if Float(curr_count) - Float(count) >= Float(1.0)
+				count = curr_count
+				print "\r" + sprintf("%5.1f%% complete", count)
+				$stdout.flush
+			end
 		end
 
+		print "\nDone\n"
 		@searches.delete(seq)
 	end
 
