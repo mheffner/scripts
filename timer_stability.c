@@ -2,10 +2,10 @@
  * Test stability of timer frequency.
  *
  * To compile:
- *	gcc -o timer_stability timer_stability.c  -lrt -lm
+ *	gcc -O2 -o timer_stability timer_stability.c  -lrt -lm
  *
  * To run:
- *	timer_stability <number procs>
+ *	timer_stability ==> Will print usage.
  *
  */
 #include <stdio.h>
@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <math.h>
 #include <unistd.h>
+#include <getopt.h>
 
 #include <sys/types.h>
 #include <sys/time.h>
@@ -25,9 +26,9 @@
 
 #define MYSIG	(SIGRTMAX - 2)
 
-#define ITERS	1000
+#define DFLT_ITERS	1000
 
-#define TIMERFREQ	10000	/* us */
+#define DFLT_TIMERFREQ	10000	/* us */
 
 static uint64_t
 get_time(void)
@@ -47,6 +48,7 @@ get_time(void)
 	return current_time;
 }
 
+static int iters, timerfreq, sleeptime;
 
 static void
 handle_sig(int sig, siginfo_t *info, void *ctxt)
@@ -56,20 +58,34 @@ handle_sig(int sig, siginfo_t *info, void *ctxt)
 	static uint64_t gaps_sq = 0;
 	static uint64_t count = 0;
 	static int pid = 0;
+	static struct timespec stime;
 	uint64_t curr_time;
 	uint64_t gap;
 
 	curr_time = get_time();
 	if (last_time == 0) {
+		/* Reset all tracking variables. */
 		last_time = curr_time;
 		gaps = gaps_sq = 0;
 		count = 0;
 		min = 1000000000;
 		max = 0;
 		pid = getpid();
+
+		if (sleeptime != -1) {
+			stime.tv_sec = sleeptime / 1000000;
+			stime.tv_nsec = (sleeptime % 1000000) * 1000;
+
+			/* Ensure we sleep in the first time sample. */
+			nanosleep(&stime, NULL);
+		}
+
+		/* No timer interval yet, so exit. */
 		return;
 	}
 
+	if (sleeptime != -1)
+		nanosleep(&stime, NULL);
 
 	gap = curr_time - last_time;
 	gaps += gap;
@@ -83,22 +99,39 @@ handle_sig(int sig, siginfo_t *info, void *ctxt)
 
 	last_time = curr_time;
 
-	if (count == ITERS) {
+	if (count == iters) {
 		double std_dev;
 
 		std_dev = sqrt((double)count * (double)gaps_sq -
 		    (double)gaps * (double)gaps);
 		std_dev /= (double)count;
 
-		printf("P: %d, I: %ld, Min: %ld, Max: %ld, Avg: %4.2f, Dev: %4.2f\n",
+		printf("P: %d, I: %ld, Min: %ld, Max: %ld, Avg: %4.2f, Dev: %5.1f%% (%4.2f)\n",
 		    pid, count, min, max, (double)gaps / (double)count,
-		    std_dev);
+		    (std_dev / (double)timerfreq) * 100.0, std_dev);
 		fflush(stdout);
 
 		last_time = 0;
 	}
 }
 
+static void
+usage(const char *name)
+{
+
+	fprintf(stderr,
+	    "Usage: %s [--iterations <iters (#)>] [--freq <freq (us)>] \\\n"
+	    "          [--sleep <time (us)>] --nprocs <nprocs>\n"
+	    "\n"
+	    "  Defaults:\n"
+	    "       Print iterations: %d\n"
+	    "       Timer frequency:  %d us.\n"
+	    "         => Will print approx. every: Iterations * Frequency us.\n"
+	    "       Sleep time: no sleep. If set, will usleep for this long\n"
+	    "                             each timer fire.\n",
+	    name, DFLT_ITERS, DFLT_TIMERFREQ);
+	exit(1);
+}
 
 int main(int ac, char **av)
 {
@@ -108,17 +141,51 @@ int main(int ac, char **av)
 	struct sigevent sevt;
 	struct itimerspec ts;
 	int nprocs;
-	int i;
+	int i, opt, idx;
 
-	if (ac != 2) {
-		printf("Usage: %s <num procs>\n", av[0]);
-		return 1;
+	enum {
+		OPT_ITERS	= (1 << 8),
+		OPT_FREQ,
+		OPT_NPROCS,
+		OPT_SLEEP,
+	};
+
+	struct option longopts[] = {
+		{ "iterations", required_argument, NULL, OPT_ITERS },
+		{ "freq", required_argument, NULL, OPT_FREQ },
+		{ "nprocs", required_argument, NULL, OPT_NPROCS },
+		{ "sleep", required_argument, NULL, OPT_SLEEP }
+	};
+
+	timerfreq = DFLT_TIMERFREQ;
+	iters = DFLT_ITERS;
+	sleeptime = -1;
+	nprocs = -1;
+	idx = 0;
+	while ((opt = getopt_long(ac, av, "", longopts, &idx)) != -1) {
+		switch (opt) {
+		case OPT_ITERS:
+			iters = atoi(optarg);
+			break;
+		case OPT_FREQ:
+			timerfreq = atoi(optarg);
+			break;
+		case OPT_NPROCS:
+			nprocs = atoi(optarg);
+			break;
+		case OPT_SLEEP:
+			if (atoi(optarg) >= 0)
+				sleeptime = atoi(optarg);
+			break;
+		default:
+			printf ("Invalid option: %d\n", opt);
+			usage(av[0]);
+		}
 	}
 
-	nprocs = atoi(av[1]);
 	if (nprocs < 1) {
-		printf("Wrong proc count\n");
-		return 1;
+		fprintf(stderr, "Invalid proc count: %d\n", nprocs);
+		usage(av[0]);
 	}
 
 	printf("Spawning %d processes...\n", nprocs);
@@ -159,8 +226,8 @@ int main(int ac, char **av)
 		return 1;
 	}
 
-	ts.it_value.tv_sec = TIMERFREQ / 1000000;
-	ts.it_value.tv_nsec = (TIMERFREQ % 1000000) * 1000;
+	ts.it_value.tv_sec = timerfreq / 1000000;
+	ts.it_value.tv_nsec = (timerfreq % 1000000) * 1000;
 
 	ts.it_interval.tv_sec = ts.it_value.tv_sec;
 	ts.it_interval.tv_nsec = ts.it_value.tv_nsec;
