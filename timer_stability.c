@@ -50,6 +50,49 @@ get_time(void)
 
 static int iters, timerfreq, sleeptime;
 
+struct cpu_stat {
+	uint64_t	user;
+	uint64_t	lowp;
+	uint64_t	sys;
+	uint64_t	idle;
+	uint64_t	iowait;
+	uint64_t	irq;
+	uint64_t	softirq;
+	uint64_t	steal;
+};
+
+static inline void
+read_proc_stat(struct cpu_stat *cpu)
+{
+	FILE *fp;
+	int num;
+
+	fp = fopen("/proc/stat", "r");
+	if (fp == NULL) {
+		fprintf(stderr, "Can not open /proc/stat\n");
+		exit(1);
+	}
+
+	num = fscanf(fp, "cpu %ld %ld %ld %ld %ld %ld %ld %ld",
+	    &cpu->user, &cpu->lowp, &cpu->sys,
+	    &cpu->idle, &cpu->iowait, &cpu->irq, &cpu->softirq,
+	    &cpu->steal);
+	if (num != 8) {
+		fprintf(stderr, "Can not read 8 items from /proc/stat\n");
+		exit(1);
+	}
+
+	fclose(fp);
+}
+
+static inline uint64_t
+total_proc_stat_time(struct cpu_stat *cpu)
+{
+
+	return cpu->user + cpu->lowp + cpu->sys + cpu->idle +
+	    cpu->iowait + cpu->irq + cpu->softirq + cpu->steal;
+}
+
 static void
 handle_sig(int sig, siginfo_t *info, void *ctxt)
 {
@@ -61,16 +104,18 @@ handle_sig(int sig, siginfo_t *info, void *ctxt)
 	static struct timespec stime;
 	uint64_t curr_time;
 	uint64_t gap;
+	struct cpu_stat cpu_start, cpu_end;
 
-	curr_time = get_time();
 	if (last_time == 0) {
 		/* Reset all tracking variables. */
-		last_time = curr_time;
 		gaps = gaps_sq = 0;
 		count = 0;
 		min = 1000000000;
 		max = 0;
 		pid = getpid();
+		read_proc_stat(&cpu_start);
+		curr_time = get_time();
+		last_time = curr_time;
 
 		if (sleeptime != -1) {
 			stime.tv_sec = sleeptime / 1000000;
@@ -82,7 +127,8 @@ handle_sig(int sig, siginfo_t *info, void *ctxt)
 
 		/* No timer interval yet, so exit. */
 		return;
-	}
+	} else
+		curr_time = get_time();
 
 	if (sleeptime != -1)
 		nanosleep(&stime, NULL);
@@ -101,14 +147,23 @@ handle_sig(int sig, siginfo_t *info, void *ctxt)
 
 	if (count == iters) {
 		double std_dev;
+		uint64_t elapsed_hz, elapsed_st_hz;
+
+		read_proc_stat(&cpu_end);
+
+		elapsed_hz = total_proc_stat_time(&cpu_end) -
+		    total_proc_stat_time(&cpu_start);
+		elapsed_st_hz = cpu_end.steal - cpu_start.steal;
 
 		std_dev = sqrt((double)count * (double)gaps_sq -
 		    (double)gaps * (double)gaps);
 		std_dev /= (double)count;
 
-		printf("P: %d, I: %ld, Min: %ld, Max: %ld, Avg: %4.2f, Dev: %5.1f%% (%4.2f)\n",
+		printf("P: %d, I: %ld, Min: %ld, Max: %ld, Avg: %4.2f, Dev: %5.1f%% (%4.2f), Steal pct: %5.1f%%\n",
 		    pid, count, min, max, (double)gaps / (double)count,
-		    (std_dev / (double)timerfreq) * 100.0, std_dev);
+		    (std_dev / (double)timerfreq) * 100.0, std_dev,
+		    elapsed_hz == 0 ? -0.1 :
+		    ((double)elapsed_st_hz / (double)elapsed_hz) * 100.0);
 		fflush(stdout);
 
 		last_time = 0;
