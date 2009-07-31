@@ -48,7 +48,7 @@ get_time(void)
 	return current_time;
 }
 
-static int iters, timerfreq, sleeptime;
+static int iters, timerfreq, yieldtime;
 
 struct cpu_stat {
 	uint64_t	user;
@@ -93,8 +93,9 @@ total_proc_stat_time(struct cpu_stat *cpu)
 	    cpu->iowait + cpu->irq + cpu->softirq + cpu->steal;
 }
 
-static void
-handle_sig(int sig, siginfo_t *info, void *ctxt)
+
+static inline void
+iter_update(void)
 {
 	static uint64_t last_time = 0, min = 0, max = 0;
 	static uint64_t gaps = 0;
@@ -117,11 +118,11 @@ handle_sig(int sig, siginfo_t *info, void *ctxt)
 		curr_time = get_time();
 		last_time = curr_time;
 
-		if (sleeptime != -1) {
-			stime.tv_sec = sleeptime / 1000000;
-			stime.tv_nsec = (sleeptime % 1000000) * 1000;
+		if (yieldtime != -1) {
+			stime.tv_sec = yieldtime / 1000000;
+			stime.tv_nsec = (yieldtime % 1000000) * 1000;
 
-			/* Ensure we sleep in the first time sample. */
+			/* Ensure we yield in the first time sample. */
 			nanosleep(&stime, NULL);
 		}
 
@@ -130,7 +131,7 @@ handle_sig(int sig, siginfo_t *info, void *ctxt)
 	} else
 		curr_time = get_time();
 
-	if (sleeptime != -1)
+	if (yieldtime != -1)
 		nanosleep(&stime, NULL);
 
 	gap = curr_time - last_time;
@@ -171,20 +172,31 @@ handle_sig(int sig, siginfo_t *info, void *ctxt)
 }
 
 static void
+handle_sig(int sig, siginfo_t *info, void *ctxt)
+{
+
+	iter_update();
+}
+
+static void
 usage(const char *name)
 {
 
 	fprintf(stderr,
 	    "Usage: %s [--iterations <iters (#)>] [--freq <freq (us)>] \\\n"
-	    "          [--sleep <time (us)>] --nprocs <nprocs>\n"
+	    "          [--yield <time (us)>] [--no-busy-loop] \\\n"
+	    "          --nprocs <nprocs>\n"
+	    "\n"
+	    "       %s [--iterations <iters (#)>] [--freq <freq (us)>] \\\n"
+	    "          --use-sleep --nprocs <nprocs>\n"
 	    "\n"
 	    "  Defaults:\n"
 	    "       Print iterations: %d\n"
 	    "       Timer frequency:  %d us.\n"
 	    "         => Will print approx. every: Iterations * Frequency us.\n"
-	    "       Sleep time: no sleep. If set, will usleep for this long\n"
+	    "       Yield time: no yield. If set, will usleep for this long\n"
 	    "                             each timer fire.\n",
-	    name, DFLT_ITERS, DFLT_TIMERFREQ);
+	    name, name, DFLT_ITERS, DFLT_TIMERFREQ);
 	exit(1);
 }
 
@@ -195,28 +207,34 @@ int main(int ac, char **av)
 	timer_t timer_id;
 	struct sigevent sevt;
 	struct itimerspec ts;
-	int nprocs;
+	int nprocs, use_sleep, use_busyloop;
 	int i, opt, idx;
 
 	enum {
 		OPT_ITERS	= (1 << 8),
 		OPT_FREQ,
 		OPT_NPROCS,
-		OPT_SLEEP,
+		OPT_YIELD,
+		OPT_USESLEEP,
+		OPT_NOBUSYLOOP,
 	};
 
 	struct option longopts[] = {
 		{ "iterations", required_argument, NULL, OPT_ITERS },
 		{ "freq", required_argument, NULL, OPT_FREQ },
 		{ "nprocs", required_argument, NULL, OPT_NPROCS },
-		{ "sleep", required_argument, NULL, OPT_SLEEP }
+		{ "yield", required_argument, NULL, OPT_YIELD },
+		{ "no-busy-loop", no_argument, NULL, OPT_NOBUSYLOOP },
+		{ "use-sleep", no_argument, NULL, OPT_USESLEEP },
 	};
 
 	timerfreq = DFLT_TIMERFREQ;
 	iters = DFLT_ITERS;
-	sleeptime = -1;
+	yieldtime = -1;
 	nprocs = -1;
 	idx = 0;
+	use_sleep = 0;
+	use_busyloop = 1;
 	while ((opt = getopt_long(ac, av, "", longopts, &idx)) != -1) {
 		switch (opt) {
 		case OPT_ITERS:
@@ -228,9 +246,15 @@ int main(int ac, char **av)
 		case OPT_NPROCS:
 			nprocs = atoi(optarg);
 			break;
-		case OPT_SLEEP:
+		case OPT_YIELD:
 			if (atoi(optarg) >= 0)
-				sleeptime = atoi(optarg);
+				yieldtime = atoi(optarg);
+			break;
+		case OPT_USESLEEP:
+			use_sleep = 1;
+			break;
+		case OPT_NOBUSYLOOP:
+			use_busyloop = 0;
 			break;
 		default:
 			printf ("Invalid option: %d\n", opt);
@@ -240,6 +264,11 @@ int main(int ac, char **av)
 
 	if (nprocs < 1) {
 		fprintf(stderr, "Invalid proc count: %d\n", nprocs);
+		usage(av[0]);
+	}
+
+	if (use_sleep && yieldtime != -1) {
+		fprintf(stderr, "Yield time can not be used with sleep mode.\n");
 		usage(av[0]);
 	}
 
@@ -256,41 +285,59 @@ int main(int ac, char **av)
 			break;
 	}
 
+	if (!use_sleep) {
+		memset(&sact, 0, sizeof(sact));
 
-	memset(&sact, 0, sizeof(sact));
+		sact.sa_sigaction = handle_sig;
+		sigemptyset(&sact.sa_mask);
+		sigaddset(&sact.sa_mask, MYSIG);
+		sact.sa_flags = SA_RESTART|SA_SIGINFO;
 
-	sact.sa_sigaction = handle_sig;
-	sigemptyset(&sact.sa_mask);
-	sigaddset(&sact.sa_mask, MYSIG);
-	sact.sa_flags = SA_RESTART|SA_SIGINFO;
+		ret = sigaction(MYSIG, &sact, NULL);
+		if (ret != 0) {
+			perror("sigaction");
+			return 1;
+		}
 
-	ret = sigaction(MYSIG, &sact, NULL);
-	if (ret != 0) {
-		perror("sigaction");
-		return 1;
+		memset(&sevt, 0, sizeof(sevt));
+		sevt.sigev_notify = SIGEV_SIGNAL;
+		sevt.sigev_signo = MYSIG;
+		sevt.sigev_value.sival_int = 0;
+
+		ret = timer_create(CLOCK_REALTIME, &sevt, &timer_id);
+		if (ret != 0) {
+			perror("timer_create");
+			return 1;
+		}
+
+		ts.it_value.tv_sec = timerfreq / 1000000;
+		ts.it_value.tv_nsec = (timerfreq % 1000000) * 1000;
+
+		ts.it_interval.tv_sec = ts.it_value.tv_sec;
+		ts.it_interval.tv_nsec = ts.it_value.tv_nsec;
+
+		timer_settime(timer_id, 0, &ts, NULL);
+
+		/* Work loop. */
+		while (1) {
+			if (!use_busyloop)
+				/* Sleep 60 seconds...this will be interrupted
+				 * by the timer anyways.
+				 */
+				usleep(60000000);
+		}
+	} else {
+		struct timespec freq_ts;
+
+		freq_ts.tv_sec = timerfreq / 1000000;
+		freq_ts.tv_nsec = (timerfreq % 1000000) * 1000;
+
+		while (1) {
+			iter_update();
+
+			nanosleep(&freq_ts, NULL);
+		}
 	}
-
-	memset(&sevt, 0, sizeof(sevt));
-	sevt.sigev_notify = SIGEV_SIGNAL;
-	sevt.sigev_signo = MYSIG;
-	sevt.sigev_value.sival_int = 0;
-
-	ret = timer_create(CLOCK_REALTIME, &sevt, &timer_id);
-	if (ret != 0) {
-		perror("timer_create");
-		return 1;
-	}
-
-	ts.it_value.tv_sec = timerfreq / 1000000;
-	ts.it_value.tv_nsec = (timerfreq % 1000000) * 1000;
-
-	ts.it_interval.tv_sec = ts.it_value.tv_sec;
-	ts.it_interval.tv_nsec = ts.it_value.tv_nsec;
-
-	timer_settime(timer_id, 0, &ts, NULL);
-
-	/* Work loop. */
-	while (1);
 
 	return 0;
 }
