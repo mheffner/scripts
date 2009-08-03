@@ -226,6 +226,7 @@ int main(int ac, char **av)
 		{ "yield", required_argument, NULL, OPT_YIELD },
 		{ "no-busy-loop", no_argument, NULL, OPT_NOBUSYLOOP },
 		{ "use-sleep", no_argument, NULL, OPT_USESLEEP },
+		{ NULL, 0, NULL, 0}
 	};
 
 	timerfreq = DFLT_TIMERFREQ;
