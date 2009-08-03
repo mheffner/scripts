@@ -48,7 +48,7 @@ get_time(void)
 	return current_time;
 }
 
-static int iters, timerfreq, yieldtime;
+static int iters, timerfreq, yieldtime, yieldpct;
 
 struct cpu_stat {
 	uint64_t	user;
@@ -106,6 +106,7 @@ iter_update(void)
 	uint64_t curr_time;
 	uint64_t gap;
 	struct cpu_stat cpu_start, cpu_end;
+	long r;
 
 	if (last_time == 0) {
 		/* Reset all tracking variables. */
@@ -122,8 +123,11 @@ iter_update(void)
 			stime.tv_sec = yieldtime / 1000000;
 			stime.tv_nsec = (yieldtime % 1000000) * 1000;
 
-			/* Ensure we yield in the first time sample. */
-			nanosleep(&stime, NULL);
+			r = random() % 10000;
+
+			if (r < yieldpct * 100)
+				/* Ensure we yield in the first time sample. */
+				nanosleep(&stime, NULL);
 		}
 
 		/* No timer interval yet, so exit. */
@@ -131,8 +135,12 @@ iter_update(void)
 	} else
 		curr_time = get_time();
 
-	if (yieldtime != -1)
-		nanosleep(&stime, NULL);
+	if (yieldtime != -1) {
+		r = random() % 10000;
+
+		if (r < yieldpct * 100)
+			nanosleep(&stime, NULL);
+	}
 
 	gap = curr_time - last_time;
 	gaps += gap;
@@ -184,8 +192,8 @@ usage(const char *name)
 
 	fprintf(stderr,
 	    "Usage: %s [--iterations <iters (#)>] [--freq <freq (us)>] \\\n"
-	    "          [--yield <time (us)>] [--no-busy-loop] \\\n"
-	    "          --nprocs <nprocs>\n"
+	    "          [--yield <time (us)>] [--yieldpct <percentag> ] \\\n"
+	    "          [--no-busy-loop] --nprocs <nprocs>\n"
 	    "\n"
 	    "       %s [--iterations <iters (#)>] [--freq <freq (us)>] \\\n"
 	    "          --use-sleep --nprocs <nprocs>\n"
@@ -195,7 +203,8 @@ usage(const char *name)
 	    "       Timer frequency:  %d us.\n"
 	    "         => Will print approx. every: Iterations * Frequency us.\n"
 	    "       Yield time: no yield. If set, will usleep for this long\n"
-	    "                             each timer fire.\n",
+	    "                             each timer fire.\n"
+	    "       Yield percentage: 100%%. Will yield this frequently.\n",
 	    name, name, DFLT_ITERS, DFLT_TIMERFREQ);
 	exit(1);
 }
@@ -215,6 +224,7 @@ int main(int ac, char **av)
 		OPT_FREQ,
 		OPT_NPROCS,
 		OPT_YIELD,
+		OPT_YIELDPCT,
 		OPT_USESLEEP,
 		OPT_NOBUSYLOOP,
 	};
@@ -224,6 +234,7 @@ int main(int ac, char **av)
 		{ "freq", required_argument, NULL, OPT_FREQ },
 		{ "nprocs", required_argument, NULL, OPT_NPROCS },
 		{ "yield", required_argument, NULL, OPT_YIELD },
+		{ "yieldpct", required_argument, NULL, OPT_YIELDPCT },
 		{ "no-busy-loop", no_argument, NULL, OPT_NOBUSYLOOP },
 		{ "use-sleep", no_argument, NULL, OPT_USESLEEP },
 		{ NULL, 0, NULL, 0}
@@ -232,6 +243,7 @@ int main(int ac, char **av)
 	timerfreq = DFLT_TIMERFREQ;
 	iters = DFLT_ITERS;
 	yieldtime = -1;
+	yieldpct = 100;
 	nprocs = -1;
 	idx = 0;
 	use_sleep = 0;
@@ -250,6 +262,11 @@ int main(int ac, char **av)
 		case OPT_YIELD:
 			if (atoi(optarg) >= 0)
 				yieldtime = atoi(optarg);
+			break;
+		case OPT_YIELDPCT:
+			if (atoi(optarg) >= 0)
+				yieldpct = atoi(optarg);
+
 			break;
 		case OPT_USESLEEP:
 			use_sleep = 1;
@@ -270,6 +287,12 @@ int main(int ac, char **av)
 
 	if (use_sleep && yieldtime != -1) {
 		fprintf(stderr, "Yield time can not be used with sleep mode.\n");
+		usage(av[0]);
+	}
+
+	if (yieldpct < 0 || yieldpct > 100) {
+		fprintf(stderr, "Yield percentage value invalid: %d\n",
+		    yieldpct);
 		usage(av[0]);
 	}
 
