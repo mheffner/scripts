@@ -11,9 +11,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <inttypes.h>
 #include <signal.h>
+#include <limits.h>
 #include <time.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -75,6 +77,23 @@ writen(int fd, void *buf, size_t count)
 	return count;
 }
 
+static int
+write_fd(int fd, const char *fmt, ...)
+{
+	va_list ap;
+	char buf[4096];
+	int ret;
+
+	va_start(ap, fmt);
+	ret = vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+
+	/* Assumes O_APPEND, so don't do writen(). */
+	write(fd, buf, strlen(buf));
+
+	return ret;
+}
+
 static uint64_t
 get_time(void)
 {
@@ -93,7 +112,8 @@ get_time(void)
 	return current_time;
 }
 
-static int iters, timerfreq, yieldtime, yieldpct;
+static uint64_t prog_start;
+static int iters, timerfreq, yieldtime, yieldpct, tcsv_fd, icsv_fd;
 
 struct cpu_stat {
 	uint64_t	user;
@@ -214,6 +234,7 @@ iter_update(void)
 	if (count == iters) {
 		double std_dev;
 		uint64_t elapsed_hz, elapsed_st_hz;
+		double steal_pct;
 
 		if (use_proc_stat) {
 			read_proc_stat(&cpu_end);
@@ -229,13 +250,22 @@ iter_update(void)
 		std_dev = sqrt((double)count * (double)gaps_sq -
 		    (double)gaps * (double)gaps);
 		std_dev /= (double)count;
+		steal_pct = elapsed_hz == 0 ? -0.1 :
+		    ((double)elapsed_st_hz / (double)elapsed_hz) * 100.0;
 
 		printf("T> P: %d, I: %ld, Min: %ld, Max: %ld, Avg: %7.1f, Dev: %5.1f%% (%4.2f), Steal pct: %5.1f%%\n",
 		    pid, count, min, max, (double)gaps / (double)count,
 		    (std_dev / (double)timerfreq) * 100.0, std_dev,
-		    elapsed_hz == 0 ? -0.1 :
-		    ((double)elapsed_st_hz / (double)elapsed_hz) * 100.0);
+		    steal_pct);
 		fflush(stdout);
+
+		if (tcsv_fd != -1)
+			write_fd(tcsv_fd,
+			    "%ld,%ld,%ld,%ld,%.1f,%.1f,%.2f,%.1f\n",
+			    (curr_time - prog_start) / 1000000,
+			    count, min, max, (double)gaps / (double)count,
+			    (std_dev / (double)timerfreq) * 100.0,
+			    std_dev, steal_pct);
 
 		last_time = 0;
 	}
@@ -257,11 +287,12 @@ usage(const char *name)
 	    "          [--yield <time (us)>] [--yieldpct <percentag> ] \\\n"
 	    "          [--io-procs <num>] [--io-bs <bs>] \\\n"
 	    "          [--io-count <count>] [--io-wait <secs>] \\\n"
-	    "          [--no-busy-loop] \\\n"
+	    "          [--io-flush] \\\n"
+	    "          [--no-busy-loop] [--csv <out>] \\\n"
 	    "          --nprocs <nprocs>\n"
 	    "\n"
 	    "       %s [--iterations <iters (#)>] [--freq <freq (us)>] \\\n"
-	    "          --use-sleep --nprocs <nprocs>\n"
+	    "          [--csv <out>] --use-sleep --nprocs <nprocs>\n"
 	    "\n"
 	    "  Defaults:\n"
 	    "       Print iterations: %d\n"
@@ -275,6 +306,8 @@ usage(const char *name)
 	    "       I/O Blocksize: 16k\n"
 	    "       I/O Count: 20000\n"
 	    "       I/O Wait: 4 seconds\n"
+	    "       CSV: Output CSV format to file.timer.csv and file.io.csv.\n"
+	    "            Off by default.\n"
 	    ,
 	    name, name, DFLT_ITERS, DFLT_TIMERFREQ);
 	exit(1);
@@ -289,10 +322,11 @@ int main(int ac, char **av)
 	struct itimerspec ts;
 	int nprocs, use_sleep, use_busyloop;
 	int i, opt, idx;
-	int io_procs, io_count, io_wait, io_bs;
+	int io_procs, io_count, io_wait, io_bs, io_flush;
 	char *procname, *buf;
 	size_t procname_len;
 	int proc_index;
+	char filebuf[PATH_MAX];
 
 	enum {
 		OPT_ITERS	= (1 << 8),
@@ -306,6 +340,8 @@ int main(int ac, char **av)
 		OPT_IO_BS,
 		OPT_IO_COUNT,
 		OPT_IO_WAIT,
+		OPT_IO_FLUSH,
+		OPT_CSV,
 	};
 
 	struct option longopts[] = {
@@ -320,6 +356,8 @@ int main(int ac, char **av)
 		{ "io-bs", required_argument, NULL, OPT_IO_BS },
 		{ "io-count", required_argument, NULL, OPT_IO_COUNT },
 		{ "io-wait", required_argument, NULL, OPT_IO_WAIT },
+		{ "io-flush", no_argument, NULL, OPT_IO_FLUSH },
+		{ "csv", required_argument, NULL, OPT_CSV },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -337,6 +375,9 @@ int main(int ac, char **av)
 	io_bs = DFLT_IO_BS;
 	io_count = DFLT_IO_COUNT;
 	io_wait = DFLT_IO_WAIT;
+	io_flush = 0;
+	tcsv_fd = -1;
+	icsv_fd = -1;
 	while ((opt = getopt_long(ac, av, "", longopts, &idx)) != -1) {
 		switch (opt) {
 		case OPT_ITERS:
@@ -374,6 +415,36 @@ int main(int ac, char **av)
 			break;
 		case OPT_IO_WAIT:
 			io_wait = atoi(optarg);
+			break;
+		case OPT_IO_FLUSH:
+			io_flush = 1;
+			break;
+		case OPT_CSV:
+			/*
+			 * Open <optarg>.timer.csv and <optarg>.io.csv
+			 */
+			snprintf(filebuf, sizeof(filebuf), "%s.timer.csv",
+			    optarg);
+			tcsv_fd = open(filebuf,
+			    O_CREAT|O_APPEND|O_WRONLY|O_TRUNC,
+			    S_IRUSR|S_IWUSR);
+			if (tcsv_fd == -1) {
+				fprintf(stderr, "Failed to open: %s\n",
+				    filebuf);
+				exit(1);
+			}
+
+			snprintf(filebuf, sizeof(filebuf), "%s.io.csv",
+			    optarg);
+			icsv_fd = open(filebuf,
+			    O_CREAT|O_APPEND|O_WRONLY|O_TRUNC,
+			    S_IRUSR|S_IWUSR);
+			if (icsv_fd == -1) {
+				fprintf(stderr, "Failed to open: %s\n",
+				    filebuf);
+				exit(1);
+			}
+
 			break;
 		default:
 			printf ("Invalid option: %d\n", opt);
@@ -423,10 +494,19 @@ int main(int ac, char **av)
 		return 1;
 	}
 
+
+	if (icsv_fd != -1)
+		write_fd(icsv_fd, "t,MBytes,Total_Time,MB/S\n");
+
+	if (tcsv_fd != -1)
+		write_fd(tcsv_fd, "t,Iters,Min,Max,Avg,Dev%,Dev,Steal%\n");
+
+	prog_start = get_time();
+
 	printf("Spawning %d timer processes...\n", nprocs);
 	fflush(stdout);
 
-	/* Fork procs. */
+	/* Fork timer procs. */
 	for (i = 1; i < nprocs; i++) {
 		proc_index = i;
 		int pid = fork();
@@ -532,6 +612,7 @@ io_proc:
 		uint64_t io_start, io_end;
 		ssize_t rd, wr;
 		char filetmp[] = "/tmp/tmpXXXXXXXXXX";
+		double tot_bytes, tot_us;
 
 		ifd = open("/dev/zero", O_RDONLY);
 		if (ifd == -1) {
@@ -566,18 +647,29 @@ io_proc:
 		/* Include the close in the time calc to include time to
 		 * flush the buffer cache.
 		 */
+		if (io_flush)
+			fdatasync(ofd);
 		close(ofd);
 		io_end = get_time();
 
 		close(ifd);
 
+		tot_bytes = (double)io_bs * (double)io_count;
+		tot_us = (double)io_end - (double)io_start;
 		printf("I> P: %d, MBytes: %5.1f, Time (s): %4.1f, MB/s: %5.1f\n",
 		    getpid(),
-		    ((double)io_bs * (double)io_count) / (double)1000000,
-		    ((double)io_end - (double)io_start) / (double)1000000,
-		    ((double)io_bs * (double)io_count) /
-		    ((double)io_end - (double)io_start));
+		    tot_bytes / 1000000.0,
+		    tot_us / 1000000.0,
+		    tot_bytes / tot_us);
 		fflush(stdout);
+
+		if (icsv_fd != -1)
+			write_fd(icsv_fd, "%ld,%.1f,%.1f,%.1f\n",
+			    (io_end - prog_start) / 1000000,
+			    tot_bytes / 1000000.0,
+			    tot_us / 1000000.0,
+			    tot_bytes / tot_us);
+
 
 		if (io_wait > 0)
 			usleep(io_wait * 1000000);
