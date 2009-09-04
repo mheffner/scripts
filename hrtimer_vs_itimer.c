@@ -25,7 +25,9 @@
  * interrupting the system call with EINTR. This leads to a permanent
  * hang of the program because the flock is never interrupted. The
  * condition occurs occaisionally so it is likely a race condition
- * between the HR timer and the itimer.
+ * between the HR timer and the itimer. Offsetting the HR timer (see
+ * DONT_ALIGN_TIMERS below) 0.5 seconds from the itimer frequency
+ * allows the SIGALRM to interrupt the flock correctly.
  *
  * Obviously, a work-around would be to block the HR timer during the
  * blocking system call. However, this is not a permanent fix as the
@@ -71,6 +73,9 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+
+/* Define this to offset the HR timer 0.5 seconds from the main itimer. */
+/* #define DONT_ALIGN_TIMERS */
 
 /* Define this to block the HR timer -- allows the SIGALRM to interrupt
  * the flock.
@@ -129,12 +134,23 @@ create_timer()
 		return -1;
 	}
 
+#ifndef DONT_ALIGN_TIMERS
 	/* Signal fires every one second. */
 	ts.it_value.tv_sec = 1;
 	ts.it_value.tv_nsec = 0;
 
 	ts.it_interval.tv_sec = ts.it_value.tv_sec;
 	ts.it_interval.tv_nsec = ts.it_value.tv_nsec;
+#else
+	/* Offset the timer 0.5 seconds to prevent it firing
+	 * concurrently with the itimer.
+	 */
+	ts.it_value.tv_sec = 0;
+	ts.it_value.tv_nsec = 500000000;
+
+	ts.it_interval.tv_sec = 1;
+	ts.it_interval.tv_nsec = 0;
+#endif
 
 	timer_settime(timer_id, 0, &ts, NULL);
 
